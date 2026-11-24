@@ -1,0 +1,151 @@
+from pathlib import Path
+import warnings
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from lightgbm import LGBMRegressor, early_stopping
+
+warnings.filterwarnings("ignore")
+
+DATA_DIR = Path("/kaggle/input/datasets/hardik06845/gridlock2-0-dt")
+train = pd.read_csv(DATA_DIR / "train.csv")
+test = pd.read_csv(DATA_DIR / "test.csv")
+
+TARGET = "demand"
+ID_COL = "Index"
+test_index = test[ID_COL].copy()
+
+BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+DECODE_MAP = {char: i for i, char in enumerate(BASE32)}
+
+
+def decode_geohash(geohash):
+    if pd.isna(geohash):
+        return np.nan, np.nan
+
+    lat_low, lat_high = -90.0, 90.0
+    lon_low, lon_high = -180.0, 180.0
+    is_longitude = True
+
+    for char in str(geohash).lower():
+        value = DECODE_MAP[char]
+        for mask in (16, 8, 4, 2, 1):
+            if is_longitude:
+                mid = (lon_low + lon_high) / 2
+                if value & mask:
+                    lon_low = mid
+                else:
+                    lon_high = mid
+            else:
+                mid = (lat_low + lat_high) / 2
+                if value & mask:
+                    lat_low = mid
+                else:
+                    lat_high = mid
+            is_longitude = not is_longitude
+
+    return (lat_low + lat_high) / 2, (lon_low + lon_high) / 2
+
+
+def create_features(data):
+    data = data.copy()
+
+    geo = data["geohash"].astype("string")
+    coords = geo.map(decode_geohash)
+    data["latitude"] = coords.map(lambda x: x[0])
+    data["longitude"] = coords.map(lambda x: x[1])
+
+    for length in (2, 3, 4, 5):
+        data[f"geo{length}"] = geo.str[:length]
+
+    time_parts = data["timestamp"].astype(str).str.split(":", expand=True)
+    data["hour"] = pd.to_numeric(time_parts[0], errors="coerce")
+    data["minute"] = pd.to_numeric(time_parts[1], errors="coerce")
+    data["time_slot"] = data["hour"] * 4 + data["minute"] / 15
+
+    data["time_sin"] = np.sin(2 * np.pi * data["time_slot"] / 96)
+    data["time_cos"] = np.cos(2 * np.pi * data["time_slot"] / 96)
+    data["is_peak"] = (
+        data["hour"].between(7, 10) | data["hour"].between(17, 21)
+    ).astype("int8")
+
+    return data
+
+
+train = create_features(train)
+test = create_features(test)
+
+categorical_cols = [
+    "geohash", "geo2", "geo3", "geo4", "geo5",
+    "RoadType", "LargeVehicles", "Landmarks", "Weather"
+]
+
+numeric_cols = [
+    "latitude", "longitude", "day", "hour", "minute", "time_slot",
+    "time_sin", "time_cos", "is_peak", "NumberofLanes", "Temperature"
+]
+
+for col in numeric_cols:
+    median_value = train[col].median()
+    train[col] = train[col].fillna(median_value)
+    test[col] = test[col].fillna(median_value)
+
+for col in categorical_cols:
+    train[col] = train[col].fillna("Missing").astype(str)
+    test[col] = test[col].fillna("Missing").astype(str)
+    categories = pd.Index(pd.concat([train[col], test[col]], ignore_index=True).unique())
+    train[col] = pd.Categorical(train[col], categories=categories)
+    test[col] = pd.Categorical(test[col], categories=categories)
+
+feature_cols = numeric_cols + categorical_cols
+X = train[feature_cols]
+y = train[TARGET].astype(float)
+X_test = test[feature_cols]
+
+X_train, X_valid, y_train, y_valid = train_test_split(
+    X, y, test_size=0.20, random_state=42, stratify=train["day"]
+)
+
+lgb_params = dict(
+    objective="regression",
+    learning_rate=0.03,
+    num_leaves=31,
+    max_depth=-1,
+    min_child_samples=30,
+    subsample=0.8,
+    subsample_freq=1,
+    colsample_bytree=0.8,
+    reg_alpha=0.1,
+    reg_lambda=0.1,
+    random_state=42,
+    n_jobs=-1,
+    verbosity=-1,
+)
+
+model = LGBMRegressor(n_estimators=5000, **lgb_params)
+model.fit(
+    X_train,
+    y_train,
+    categorical_feature=categorical_cols,
+    eval_set=[(X_valid, y_valid)],
+    eval_metric="rmse",
+    callbacks=[early_stopping(stopping_rounds=150, verbose=False)],
+)
+
+valid_preds = np.clip(model.predict(X_valid, num_iteration=model.best_iteration_), 0, 1)
+print(
+    f"R2: {r2_score(y_valid, valid_preds):.5f} | "
+    f"MAE: {mean_absolute_error(y_valid, valid_preds):.5f} | "
+    f"RMSE: {np.sqrt(mean_squared_error(y_valid, valid_preds)):.5f}"
+)
+
+final_model = LGBMRegressor(n_estimators=model.best_iteration_, **lgb_params)
+final_model.fit(X, y, categorical_feature=categorical_cols)
+
+test_preds = np.clip(final_model.predict(X_test), 0, 1)
+
+pd.DataFrame({ID_COL: test_index, TARGET: test_preds}).to_csv(
+    "submission_defensible.csv", index=False
+)
